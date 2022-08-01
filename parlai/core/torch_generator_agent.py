@@ -425,7 +425,16 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         )
         agent.add_argument(
             '--inference',
-            choices={'beam', 'greedy', 'topk', 'nucleus', 'delayedbeam'},
+            choices={
+                'beam',
+                'greedy',
+                'topk',
+                'nucleus',
+                'delayedbeam',
+                "switch",
+                "switch-ent",
+                "switch-sim",
+            },
             default='greedy',
             help='Generation algorithm',
         )
@@ -462,7 +471,15 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             help='Set to use CUDA kernel for beam search ngram blocking',
             default=False,
         )
-
+        agent.add_argument(
+            '--threshold', type=float, default=0.5, help='used in switch-sim search'
+        )
+        agent.add_argument(
+            '--fair_comparison', type="bool", default=False, help="include sampling in beam computation"
+        )
+        agent.add_argument(
+            '--ent-threshold', type=float, default=2.0, help='used in switch-ent search'
+        )
         super().add_cmdline_args(parser, partial_opt=partial_opt)
         return agent
 
@@ -1024,6 +1041,57 @@ class TorchGeneratorAgent(TorchAgent, ABC):
                 verbose=verbose,
                 gpu_beam_blocking=self.opt.get('gpu_beam_blocking', False),
             )
+
+        # ToDo: Implment Switch Mechanism
+        elif method == 'switch':
+            return SwitchSearch(
+                self.opt['topk'],
+                self.opt['beam_delay'],
+                beam_size,
+                min_length=self.beam_min_length,
+                block_ngram=self.beam_block_ngram,
+                context_block_ngram=self.beam_context_block_ngram,
+                length_penalty=self.opt.get('beam_length_penalty', 0.65),
+                padding_token=self.NULL_IDX,
+                bos_token=self.START_IDX,
+                eos_token=self.END_IDX,
+                device=device,
+                verbose=verbose,
+                gpu_beam_blocking=self.opt.get('gpu_beam_blocking', False),
+            )
+        elif method == 'switch-ent':
+            return SwitchSearchEnt(
+                self.opt['topk'],
+                self.opt['ent_threshold'],
+                beam_size,
+                min_length=self.beam_min_length,
+                block_ngram=self.beam_block_ngram,
+                context_block_ngram=self.beam_context_block_ngram,
+                length_penalty=self.opt.get('beam_length_penalty', 0.65),
+                padding_token=self.NULL_IDX,
+                bos_token=self.START_IDX,
+                eos_token=self.END_IDX,
+                device=device,
+                verbose=verbose,
+                gpu_beam_blocking=self.opt.get('gpu_beam_blocking', False),
+            )
+        elif method == 'switch-sim':
+            return SwitchSearchSim(
+                self.opt['topk'],
+                self.opt["threshold"],
+                self.opt["fair_comparison"],
+                beam_size,
+                min_length=self.beam_min_length,
+                block_ngram=self.beam_block_ngram,
+                context_block_ngram=self.beam_context_block_ngram,
+                length_penalty=self.opt.get('beam_length_penalty', 0.65),
+                padding_token=self.NULL_IDX,
+                bos_token=self.START_IDX,
+                eos_token=self.END_IDX,
+                device=device,
+                verbose=verbose,
+                gpu_beam_blocking=self.opt.get('gpu_beam_blocking', False),
+            )
         else:
             raise ValueError(f"Can't use inference method {method}")
 
@@ -1177,6 +1245,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         encoder_states = model.reorder_encoder_states(encoder_states, inds)
         incr_state = None
 
+
         for _ts in range(max_ts):
             if all((b.is_done() for b in beams)):
                 # exit early if possible
@@ -1185,6 +1254,21 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             score, incr_state = model.decoder(decoder_input, encoder_states, incr_state)
             # only need the final hidden state to make the word prediction
             score = score[:, -1:, :]
+            # score = bsz*beam_size x hidden
+            if _ts==0:
+                # Initialize with zeros (for zero similarity)
+                hidden_states_all_ts = torch.zeros(bsz*beam_size, 1, score.size(-1)).to(dev)
+            curr_hidden = score.view(bsz*beam_size,1,-1).detach().clone()
+            sim_score = torch.nn.functional.cosine_similarity(hidden_states_all_ts, curr_hidden, dim=-1)
+            # sim_score = beam_size*batch_size x timestep
+            sim_score, _ = sim_score.max(dim=1)
+            # sim_score = beam_size*batch_size
+            sim_score = sim_score.view(bsz, beam_size)
+            # sim_score = beam_size x batch_size
+
+            # Todo Refine the following Code
+            hidden_states_all_ts = torch.cat([hidden_states_all_ts, curr_hidden], dim=1)
+            # hidden_states_all_ts = bsz*beam_size x 1+time_step x output_dim
             score = model.output(score)
             # score contains softmax scores for bsz * beam_size samples
             score = score.view(bsz, beam_size, -1)
@@ -1203,7 +1287,12 @@ class TorchGeneratorAgent(TorchAgent, ABC):
                 score[prefix_mask] = neginf(score.dtype)
             for i, b in enumerate(beams):
                 if not b.is_done():
-                    b.advance(score[i], _ts)
+                    # score[i] = size(beam x output_dim)
+                    if self.opt["inference"] =="switch-sim":
+                        b.advance(score[i], _ts, sim_score[i])
+                    else:
+                        b.advance(score[i], _ts)
+                    # b.advance(score[i], _ts, sim_score)
             incr_state_inds = torch.cat(
                 [
                     beam_size * i + b.get_backtrack_from_current_step()
@@ -1219,6 +1308,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             decoder_input = self._get_next_decoder_input(
                 decoder_input, selection, incr_state_inds
             )
+            # Reorder the hidden_states
+            hidden_states_all_ts = torch.index_select(hidden_states_all_ts, 0, incr_state_inds)
 
         # get all finalized candidates for each sample (and validate them)
         n_best_beam_preds_scores = [b.get_rescored_finished() for b in beams]
@@ -1518,11 +1609,12 @@ class TreeSearch(object):
                         logprobs[beam_id][ngram[-1]] = neginf(logprobs.dtype)
         return logprobs
 
-    def advance(self, logprobs, step):
+    def advance(self, logprobs, step, sim_score=None):
         """
         Advance the beam one step.
         """
         current_length = len(self.all_scores) - 1
+
         if current_length < self.min_length:
             # penalize all eos probs to make it decode longer
             for hyp_id in range(logprobs.size(0)):
@@ -1561,8 +1653,10 @@ class TreeSearch(object):
                 step=step,
                 if_context_blocking=True,
             )
-
-        path_selection = self.select_paths(logprobs, self.scores, current_length)
+        if sim_score is not None:
+            path_selection = self.select_paths(logprobs, self.scores, current_length, sim_score)
+        else:
+            path_selection = self.select_paths(logprobs, self.scores, current_length)
         self.scores = path_selection.scores
         # use clone() here to ensure that self.all_scores will not be changed
         # later due to any penalties to self.scores
@@ -1604,8 +1698,7 @@ class TreeSearch(object):
                     timestep=len(self.outputs) - 1,
                     hypid=hypid,
                     score=self.all_scores[-1][hypid],
-                    tokenid=self.eos,
-                    token_details=self.token_details[hypid][-1]
+                    tokenid=self.eos, token_details=self.token_details[hypid][-1]
                     if self.token_details is not None
                     else None,
                 )
@@ -1836,6 +1929,78 @@ class BeamSearch(TreeSearch):
             token_details=token_details,
         )
 
+class CustomBeamSearch(TreeSearch):
+    """
+    Beam search.
+    """
+
+    def select_paths(self, logprobs, prior_scores, current_length, index) -> _PathSelection:
+        """
+        Select the next vocabulary item in these beams.
+        """
+        # if numel is 1, then this is the first time step, only one hyp is expanded
+        if prior_scores.numel() == 1:
+            logprobs = logprobs[0:1]
+
+        if index.sum():
+            beam_out = logprobs[~index]
+            beam_out_index = torch.nonzero(~index).view(-1)
+            sample_out_index = torch.nonzero(index).view(-1)
+            sample_out = logprobs[index]
+            sampleResult = TopKSampling.select_paths(self, sample_out, prior_scores[index], current_length)
+            token_ids = sampleResult.token_ids
+            scores = sampleResult.scores
+            sample_out = torch.full_like(sample_out, float("-inf"))
+            sample_out= sample_out.scatter_(-1, token_ids.unsqueeze(1), scores.unsqueeze(1))
+            logprobs = torch.cat([beam_out, sample_out], 0)
+            logprobs = torch.index_select(logprobs, 0, torch.cat([beam_out_index, sample_out_index]))
+
+        # beam search actually looks over all hypotheses together so we flatten
+        beam_scores = logprobs + prior_scores.unsqueeze(1).expand_as(logprobs)
+
+
+        flat_beam_scores = beam_scores.view(-1)
+        best_scores, best_idxs = torch.topk(flat_beam_scores, self.beam_size, dim=-1)
+        voc_size = logprobs.size(-1)
+
+        # get the backtracking hypothesis id as a multiple of full voc_sizes
+        hyp_ids = torch.div(best_idxs, voc_size, rounding_mode='trunc')
+        # get the actual word id from residual of the same division
+        tok_ids = best_idxs % voc_size
+
+        token_details: Optional[List[_PathSelectionTokenDetails]] = None
+        if self.verbose:
+            probs = torch.softmax(logprobs, dim=-1)
+            tok_probs = (
+                torch.index_select(probs, 0, hyp_ids)
+                .gather(1, tok_ids.unsqueeze(1))
+                .view(-1)
+            )
+            tok_ranks = (
+                probs.argsort(1, descending=True)
+                .argsort(1)
+                .view(-1)
+                .gather(0, best_idxs)
+            )
+
+            token_details = []
+
+            for tok_logprob, tok_rank in zip(
+                tok_probs.log().cpu().numpy(), tok_ranks.cpu().numpy()
+            ):
+                token_details.append(
+                    {
+                        "token_logprob": tok_logprob.item(),
+                        "token_rank": int(tok_rank.item()),
+                    }
+                )
+
+        return _PathSelection(
+            hypothesis_ids=hyp_ids,
+            token_ids=tok_ids,
+            scores=best_scores,
+            token_details=token_details,
+        )
 
 class DelayedBeamSearch(TreeSearch):
     """
@@ -1879,6 +2044,8 @@ class TopKSampling(TreeSearch):
         self.k = k
 
     def select_paths(self, logprobs, prior_scores, current_length) -> _PathSelection:
+
+        # logprobs = batchsize x output_dim
         values, indices = logprobs.topk(self.k, dim=-1)
         probs = torch.softmax(values, dim=-1)
         choices = torch.multinomial(probs, 1)[:, 0]
@@ -1957,3 +2124,135 @@ class NucleusSampling(TreeSearch):
             scores=best_scores,
             token_details=token_details,
         )
+
+
+# Todo: Implement Switch Mechanism
+class SwitchSearch(TreeSearch):
+    """
+    Swith Search
+    """
+
+    def __init__(self, k, delay, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = k
+        self.delay = delay
+
+    def select_paths(self, logprobs, prior_scores, current_length) -> _PathSelection:
+        if current_length % self.delay == 0:
+            return TopKSampling.select_paths(
+                self, logprobs, prior_scores, current_length
+            )
+        else:
+            return BeamSearch.select_paths(self, logprobs, prior_scores, current_length)
+
+class SwitchSearchEnt(TreeSearch):
+    """
+    Swith Search
+    """
+    def __init__(self, k, ent_threshold, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = k
+        self.ent_threshold= ent_threshold
+    def select_paths(self, logprobs, prior_scores, current_length) -> _PathSelection:
+        # logprobs = beam-width x output_dim
+        ent = (logprobs.exp() * -logprobs).sum(dim=-1)
+        index = ent< self.ent_threshold
+        topk_result=None
+        beam_result=None
+        if index.sum():
+            if prior_scores.numel()==1:
+                topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores, current_length)
+            else:
+                topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores[index], current_length)
+        if (~index).sum():
+            beam_num = (~index).sum()
+            # self.beam_size = beam_num
+            if prior_scores.numel()==1:
+                beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores, current_length)
+            else:
+                beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores[~index], current_length)
+        if topk_result and beam_result:
+            # Merge
+            hyp_1, tokid_1, sco_1, tok_1 = topk_result.hypothesis_ids, topk_result.token_ids, topk_result.scores, topk_result.token_details
+            hyp_2, tokid_2, sco_2, tok_2 = beam_result.hypothesis_ids, beam_result.token_ids, beam_result.scores, beam_result.token_details
+            hyp_2, tokid_2, sco_2 = hyp_2[:beam_num], tokid_2[:beam_num], sco_2[:beam_num]
+            # Restore the Hypothesis Ordering
+            reorder_hyp_sample = torch.nonzero(index).view(-1)
+            reorder_hyp_likelihood = torch.nonzero(~index).view(-1)
+            hyp_1 = reorder_hyp_sample.gather(index=hyp_1, dim=-1)
+            hyp_2 = reorder_hyp_likelihood.gather(index=hyp_2, dim=-1)
+            return _PathSelection(
+                hypothesis_ids=torch.cat([hyp_1, hyp_2]),
+                token_ids=torch.cat([tokid_1, tokid_2]),
+                scores=torch.cat([sco_1, sco_2]),
+                token_details=None,
+            )
+        elif topk_result:
+            return topk_result
+        elif beam_result:
+            return beam_result
+
+class SwitchSearchSim(TreeSearch):
+    """
+    Swith Search Using Similarity Scores
+    """
+    def __init__(self, k, threshold, fair_comparison, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = k
+        self.threshold = threshold
+        self.fair_comparison = fair_comparison
+    
+    def select_paths(self, logprobs, prior_scores, current_length, sim_scores) -> _PathSelection:
+        index = sim_scores > self.threshold
+        if not self.fair_comparison:
+            topk_result=None
+            beam_result=None
+            if index.sum():
+                if prior_scores.numel()==1:
+                    topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores, current_length)
+                else:
+                    topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores[index], current_length)
+            if (~index).sum():
+                beam_num = (~index).sum()
+                # self.beam_size = beam_num
+                if prior_scores.numel()==1:
+                    beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores, current_length)
+                else:
+                    beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores[~index], current_length)
+            if topk_result and beam_result:
+                # Merge
+                hyp_1, tokid_1, sco_1, tok_1 = topk_result.hypothesis_ids, topk_result.token_ids, topk_result.scores, topk_result.token_details
+                hyp_2, tokid_2, sco_2, tok_2 = beam_result.hypothesis_ids, beam_result.token_ids, beam_result.scores, beam_result.token_details
+                # if self.fair_comparison:
+                #     reorder_1= torch.nonzero(index).view(-1)
+                #     reorder_2= torch.nonzero(~index).view(-1)
+                #     hyp = torch.cat([reorder_1[hyp_1], reorder_2[hyp_2]])
+                #     sco = torch.cat([sco_1, sco_2])
+                #     tokid = torch.cat([tokid_1, tokid_2])
+                #     sco_arg_sort = sco.argsort()
+                #     keep_index= sco_arg_sort < self.beam_size
+                #     return _PathSelection(
+                #         hypothesis_ids=hyp[keep_index][sco_arg_sort[keep_index]],
+                #         token_ids=tokid[keep_index][sco_arg_sort[keep_index]],
+                #         scores=sco[keep_index][sco_arg_sort[keep_index]],
+                #         token_details=None,
+                #     )
+                hyp_2, tokid_2, sco_2 = hyp_2[:beam_num], tokid_2[:beam_num], sco_2[:beam_num]
+                # Restore the Hypothesis Ordering
+                reorder_hyp_sample = torch.nonzero(index).view(-1)
+                reorder_hyp_likelihood = torch.nonzero(~index).view(-1)
+                hyp_1 = reorder_hyp_sample.gather(index=hyp_1, dim=-1)
+                hyp_2 = reorder_hyp_likelihood.gather(index=hyp_2, dim=-1)
+                return _PathSelection(
+                    hypothesis_ids=torch.cat([hyp_1, hyp_2]),
+                    token_ids=torch.cat([tokid_1, tokid_2]),
+                    scores=torch.cat([sco_1, sco_2]),
+                    token_details=None,
+                )
+            elif topk_result:
+                return topk_result
+            elif beam_result:
+                return beam_result
+        else:
+            custom_beam_result = CustomBeamSearch.select_paths(self, logprobs, prior_scores, current_length, index)
+            return custom_beam_result
