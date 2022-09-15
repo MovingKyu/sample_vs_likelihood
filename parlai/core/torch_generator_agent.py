@@ -475,10 +475,10 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             '--threshold', type=float, default=0.5, help='used in switch-sim search'
         )
         agent.add_argument(
-            '--fair_comparison', type="bool", default=False, help="include sampling in beam computation"
+            '--fair-comparison', type="bool", default=False, help="include sampling in beam computation"
         )
         agent.add_argument(
-            '--ent-threshold', type=float, default=2.0, help='used in switch-ent search'
+            '--custom-temperature', type=float, default=1.0, help='used in switch-sim search'
         )
         super().add_cmdline_args(parser, partial_opt=partial_opt)
         return agent
@@ -1080,6 +1080,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
                 self.opt['topk'],
                 self.opt["threshold"],
                 self.opt["fair_comparison"],
+                self.opt["custom_temperature"],
                 beam_size,
                 min_length=self.beam_min_length,
                 block_ngram=self.beam_block_ngram,
@@ -1274,6 +1275,11 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             score = score.view(bsz, beam_size, -1)
             if self.temperature != 1.0:
                 score.div_(self.temperature)
+            if self.opt["inference"]=="switch-sim":
+                custom_temperature = torch.ones(sim_score.size(0), sim_score.size(1), 1, device=sim_score.device)
+                custom_temperature.masked_fill_(sim_score.unsqueeze(2)>self.opt["threshold"], self.opt["custom_temperature"])
+                score = score/custom_temperature
+
             # force to fp32 to avoid overflow issues during search calculations
             score = F.log_softmax(score, dim=-1, dtype=torch.float32)  # type: ignore
             if prefix_tokens is not None and _ts < prefix_tokens.size(1):
@@ -2196,63 +2202,54 @@ class SwitchSearchSim(TreeSearch):
     """
     Swith Search Using Similarity Scores
     """
-    def __init__(self, k, threshold, fair_comparison, *args, **kwargs):
+    def __init__(self, k, threshold, fair_comparison, custom_temp, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.k = k
         self.threshold = threshold
         self.fair_comparison = fair_comparison
+        self.custom_temp = custom_temp
     
     def select_paths(self, logprobs, prior_scores, current_length, sim_scores) -> _PathSelection:
         index = sim_scores > self.threshold
-        if not self.fair_comparison:
-            topk_result=None
-            beam_result=None
-            if index.sum():
-                if prior_scores.numel()==1:
-                    topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores, current_length)
-                else:
-                    topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores[index], current_length)
-            if (~index).sum():
-                beam_num = (~index).sum()
-                # self.beam_size = beam_num
-                if prior_scores.numel()==1:
-                    beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores, current_length)
-                else:
-                    beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores[~index], current_length)
-            if topk_result and beam_result:
-                # Merge
-                hyp_1, tokid_1, sco_1, tok_1 = topk_result.hypothesis_ids, topk_result.token_ids, topk_result.scores, topk_result.token_details
-                hyp_2, tokid_2, sco_2, tok_2 = beam_result.hypothesis_ids, beam_result.token_ids, beam_result.scores, beam_result.token_details
-                # if self.fair_comparison:
-                #     reorder_1= torch.nonzero(index).view(-1)
-                #     reorder_2= torch.nonzero(~index).view(-1)
-                #     hyp = torch.cat([reorder_1[hyp_1], reorder_2[hyp_2]])
-                #     sco = torch.cat([sco_1, sco_2])
-                #     tokid = torch.cat([tokid_1, tokid_2])
-                #     sco_arg_sort = sco.argsort()
-                #     keep_index= sco_arg_sort < self.beam_size
-                #     return _PathSelection(
-                #         hypothesis_ids=hyp[keep_index][sco_arg_sort[keep_index]],
-                #         token_ids=tokid[keep_index][sco_arg_sort[keep_index]],
-                #         scores=sco[keep_index][sco_arg_sort[keep_index]],
-                #         token_details=None,
-                #     )
-                hyp_2, tokid_2, sco_2 = hyp_2[:beam_num], tokid_2[:beam_num], sco_2[:beam_num]
-                # Restore the Hypothesis Ordering
-                reorder_hyp_sample = torch.nonzero(index).view(-1)
-                reorder_hyp_likelihood = torch.nonzero(~index).view(-1)
-                hyp_1 = reorder_hyp_sample.gather(index=hyp_1, dim=-1)
-                hyp_2 = reorder_hyp_likelihood.gather(index=hyp_2, dim=-1)
-                return _PathSelection(
-                    hypothesis_ids=torch.cat([hyp_1, hyp_2]),
-                    token_ids=torch.cat([tokid_1, tokid_2]),
-                    scores=torch.cat([sco_1, sco_2]),
-                    token_details=None,
-                )
-            elif topk_result:
-                return topk_result
-            elif beam_result:
-                return beam_result
-        else:
-            custom_beam_result = CustomBeamSearch.select_paths(self, logprobs, prior_scores, current_length, index)
-            return custom_beam_result
+        topk_result=None
+        beam_result=None
+        if index.sum():
+            if prior_scores.numel()==1:
+                topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores, current_length)
+            else:
+                topk_result = TopKSampling.select_paths(self, logprobs[index], prior_scores[index], current_length)
+        if (~index).sum():
+            beam_num = (~index).sum()
+            # self.beam_size = beam_num
+            if prior_scores.numel()==1:
+                beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores, current_length)
+            else:
+                beam_result = BeamSearch.select_paths(self, logprobs[~index], prior_scores[~index], current_length)
+        if topk_result and beam_result:
+            # Merge
+            hyp_1, tokid_1, sco_1, tok_1 = topk_result.hypothesis_ids, topk_result.token_ids, topk_result.scores, topk_result.token_details
+            hyp_2, tokid_2, sco_2, tok_2 = beam_result.hypothesis_ids, beam_result.token_ids, beam_result.scores, beam_result.token_details
+
+            # hyp_2, tokid_2, sco_2 = hyp_2[:beam_num], tokid_2[:beam_num], sco_2[:beam_num]
+            # Restore the Hypothesis Ordering
+            reorder_hyp_sample = torch.nonzero(index).view(-1)
+            reorder_hyp_likelihood = torch.nonzero(~index).view(-1)
+            hyp_1 = reorder_hyp_sample.gather(index=hyp_1, dim=-1)
+            hyp_2 = reorder_hyp_likelihood.gather(index=hyp_2, dim=-1)
+
+            hypothesis_ids=torch.cat([hyp_1, hyp_2])
+            token_ids=torch.cat([tokid_1, tokid_2])
+            scores=torch.cat([sco_1, sco_2])
+            reindex = torch.argsort(scores, descending=True)
+            return_index = sim_scores.size(0)
+
+            return _PathSelection(
+                hypothesis_ids=hypothesis_ids[reindex][:return_index],
+                token_ids=token_ids[reindex][:return_index],
+                scores=scores[reindex][:return_index],
+                token_details=None,
+            )
+        elif topk_result:
+            return topk_result
+        elif beam_result:
+            return beam_result
